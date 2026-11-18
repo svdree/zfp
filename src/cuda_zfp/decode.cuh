@@ -57,14 +57,31 @@ public:
     :  m_maxbits(maxbits), m_valid_block(true)
   {
     if(block_idx >= num_blocks) m_valid_block = false;
-    size_t word_index = ((size_t)block_idx * maxbits)  / (sizeof(Word) * 8); 
+    size_t word_index = ((size_t)block_idx * maxbits)  / (sizeof(Word) * 8);
     m_words = b + word_index;
     m_buffer = *m_words;
-    m_current_bit = ((size_t)block_idx * maxbits) % (sizeof(Word) * 8); 
+    m_current_bit = ((size_t)block_idx * maxbits) % (sizeof(Word) * 8);
 
     m_buffer >>= m_current_bit;
     m_block_idx = block_idx;
-   
+
+  }
+
+  // variable-rate constructor: blocks are not a fixed number of bits apart,
+  // so the starting bit offset of this block must be supplied explicitly
+  // (e.g. from a precomputed per-block offset table) rather than derived
+  // from block_idx * maxbits.
+  __device__ BlockReader(Word *b, const uint64 &bit_offset, const int &block_idx, const int &num_blocks)
+    :  m_maxbits(0), m_valid_block(true)
+  {
+    if(block_idx >= num_blocks) m_valid_block = false;
+    size_t word_index = (size_t)(bit_offset / (sizeof(Word) * 8));
+    m_words = b + word_index;
+    m_buffer = *m_words;
+    m_current_bit = (int)(bit_offset % (sizeof(Word) * 8));
+
+    m_buffer >>= m_current_bit;
+    m_block_idx = block_idx;
   }
   inline __device__
   void print()
@@ -178,6 +195,62 @@ void decode_ints(BlockReader<size> &reader, uint maxbits, UInt *data)
 #endif
 }
 
+// maximum number of bit planes to decode for a block with common exponent
+// maxexp, mirrors src/template/codecf.c's precision(); used by the
+// fixed-precision (variable-rate) decode path, where block length is not
+// known ahead of time and instead derives from maxprec/minexp per block.
+inline __host__ __device__
+int precision(int maxexp, int maxprec, int minexp, int dims)
+{
+#if (ZFP_ROUNDING_MODE != ZFP_ROUND_NEVER) && defined(ZFP_WITH_TIGHT_ERROR)
+  return min(maxprec, max(0, maxexp - minexp + 2 * dims + 1));
+#else
+  return min(maxprec, max(0, maxexp - minexp + 2 * dims + 2));
+#endif
+}
+
+// decode a block's integer coefficients down to maxprec bit planes, with no
+// bit-budget limit (mirrors src/template/decode.c's decode_few_ints_prec /
+// decode_many_ints_prec -- both have identical bit-consuming control flow,
+// so a single version suffices for the block sizes used here, all <= 64)
+template <typename Scalar, uint size, typename UInt>
+inline __device__
+void decode_ints_prec(BlockReader<size> &reader, int maxprec, UInt *data)
+{
+  const int intprec = get_precision<Scalar>();
+  const int kmin = intprec > maxprec ? intprec - maxprec : 0;
+  uint n = 0;
+  int k;
+
+  memset(data, 0, size * sizeof(UInt));
+
+  // decode one bit plane at a time from MSB to LSB
+  for (k = intprec; k-- > kmin;) {
+    // step 1: decode first n bits of bit plane #k
+    uint64 x = reader.read_bits(n);
+    // step 2: unary run-length decode remainder of bit plane
+    for (; n < size && reader.read_bit(); x += (uint64)1 << n, n++) {
+      for (; n < size - 1 && !reader.read_bit(); n++)
+        ;
+    }
+    // step 3: deposit bit plane from x
+#if (CUDART_VERSION < 8000)
+    #pragma unroll
+#else
+    #pragma unroll size
+#endif
+    for (uint i = 0; x; i++, x >>= 1)
+      data[i] += (UInt)(x & 1u) << k;
+  }
+
+#if ZFP_ROUNDING_MODE == ZFP_ROUND_LAST
+  // bias values to achieve proper rounding (mirrors decode_few_ints_prec's
+  // call with m = 0: unlike the rate-constrained path, every one of the
+  // `size` slots gets the same bias here, not just the first n)
+  inv_round<UInt, size>(data, 0, intprec - k);
+#endif
+}
+
 template<int BlockSize>
 struct inv_transform;
 
@@ -224,6 +297,66 @@ struct inv_transform<4>
     inv_lift<Int, 1>(p);
   }
 };
+
+// decode a single block in fixed-precision (variable-rate) mode: like
+// zfp_decode() below, but the per-block compressed size is not maxbits --
+// it depends on the block's own common exponent (for floats) combined with
+// maxprec/minexp, so the integer coder runs to completion rather than
+// against a bit budget. The caller is responsible for positioning `reader`
+// at this block's actual starting bit offset (see the offset-table
+// BlockReader constructor above) and for having pre-zeroed fblock.
+template<typename Scalar, int BlockSize>
+__device__ void zfp_decode_precision(BlockReader<BlockSize> &reader, Scalar *fblock, int maxprec, int minexp, int dims)
+{
+  typedef typename zfp_traits<Scalar>::UInt UInt;
+  typedef typename zfp_traits<Scalar>::Int Int;
+
+  uint s_cont = 1;
+  // there is no skip path for integers so just continue
+  if(!is_int<Scalar>())
+  {
+    s_cont = reader.read_bit();
+  }
+
+  if(s_cont)
+  {
+    int mp = maxprec;
+    int emax = 0;
+    if(!is_int<Scalar>())
+    {
+      uint ebits = get_ebits<Scalar>();
+      // read in the shared exponent
+      emax = (int)reader.read_bits(ebits) - get_ebias<Scalar>();
+      mp = precision(emax, maxprec, minexp, dims);
+    }
+
+    UInt ublock[BlockSize];
+    decode_ints_prec<Scalar, BlockSize, UInt>(reader, mp, ublock);
+
+    Int iblock[BlockSize];
+    const unsigned char *perm = get_perm<BlockSize>();
+#if (CUDART_VERSION < 8000)
+    #pragma unroll
+#else
+    #pragma unroll BlockSize
+#endif
+    for (int i = 0; i < BlockSize; ++i)
+      iblock[perm[i]] = uint2int(ublock[i]);
+
+    inv_transform<BlockSize> trans;
+    trans.inv_xform(iblock);
+
+    Scalar inv_w = dequantize<Int, Scalar>(1, emax);
+
+#if (CUDART_VERSION < 8000)
+    #pragma unroll
+#else
+    #pragma unroll BlockSize
+#endif
+    for (int i = 0; i < BlockSize; ++i)
+      fblock[i] = inv_w * (Scalar)iblock[i];
+  }
+}
 
 template<typename Scalar, int BlockSize>
 __device__ void zfp_decode(BlockReader<BlockSize> &reader, Scalar *fblock, uint maxbits)

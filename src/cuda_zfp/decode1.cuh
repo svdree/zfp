@@ -76,8 +76,107 @@ cudaDecode1(Word *blocks,
   }
 }
 
+// fixed-precision (variable-rate) counterpart of cudaDecode1; see
+// cudaDecode3Precision in decode3.cuh for the rationale.
 template<class Scalar>
-size_t decode1launch(uint dim, 
+__global__
+void
+cudaDecode1Precision(Word *blocks,
+                      const uint64 *block_offsets,
+                      Scalar *out,
+                      const uint dim,
+                      const int stride,
+                      const uint padded_dim,
+                      int maxprec,
+                      int minexp,
+                      uint num_blocks)
+{
+  typedef unsigned long long int ull;
+  typedef long long int ll;
+
+  const ull blockId = blockIdx.x +
+                      blockIdx.y * gridDim.x +
+                      gridDim.x  * gridDim.y * blockIdx.z;
+
+  const ull block_idx = blockId * blockDim.x + threadIdx.x;
+
+  if(block_idx >= num_blocks) return;
+
+  BlockReader<4> reader(blocks, block_offsets[block_idx], block_idx, num_blocks);
+  Scalar result[4] = {0,0,0,0};
+
+  zfp_decode_precision<Scalar, 4>(reader, result, maxprec, minexp, 1);
+
+  uint block;
+  block = block_idx * 4ull;
+  const ll offset = (ll)block * stride;
+
+  bool partial = false;
+  if(block + 4 > dim) partial = true;
+  if(partial)
+  {
+    const uint nx = 4u - (padded_dim - dim);
+    scatter_partial1(result, out + offset, nx, stride);
+  }
+  else
+  {
+    scatter1(result, out + offset, stride);
+  }
+}
+
+template<class Scalar>
+void decode1launch_precision(uint dim,
+                              int stride,
+                              Word *stream,
+                              const uint64 *d_block_offsets,
+                              size_t num_blocks,
+                              Scalar *d_data,
+                              int maxprec,
+                              int minexp)
+{
+  const int cuda_block_size = 128;
+
+  uint zfp_pad(dim);
+  if(zfp_pad % 4 != 0) zfp_pad += 4 - dim % 4;
+
+  int block_pad = 0;
+  if(num_blocks % cuda_block_size != 0)
+  {
+    block_pad = cuda_block_size - num_blocks % cuda_block_size;
+  }
+
+  size_t launch_blocks = block_pad + num_blocks;
+
+  dim3 block_size = dim3(cuda_block_size, 1, 1);
+  dim3 grid_size = calculate_grid_size(launch_blocks, cuda_block_size);
+
+  cudaDecode1Precision<Scalar> << < grid_size, block_size >> >
+    (stream,
+     d_block_offsets,
+     d_data,
+     dim,
+     stride,
+     zfp_pad,
+     maxprec,
+     minexp,
+     (uint)num_blocks);
+}
+
+template<class Scalar>
+void decode1_precision(uint dim,
+                        int stride,
+                        Word *stream,
+                        const uint64 *d_block_offsets,
+                        size_t num_blocks,
+                        Scalar *d_data,
+                        int maxprec,
+                        int minexp)
+{
+  decode1launch_precision<Scalar>(dim, stride, stream, d_block_offsets, num_blocks, d_data, maxprec, minexp);
+}
+
+template<class Scalar>
+size_t decode1launch(uint dim,
                      int stride,
                      Word *stream,
                      Scalar *d_data,

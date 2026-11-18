@@ -8,6 +8,7 @@ extern "C" {
 #endif
   size_t cuda_compress(zfp_stream *stream, const zfp_field *field);
   void cuda_decompress(zfp_stream *stream, zfp_field *field);
+  void cuda_decompress_precision(zfp_stream *stream, zfp_field *field);
 #ifdef __cplusplus
 }
 #endif
